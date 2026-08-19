@@ -10,11 +10,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      http_proxy: ''
-      https_proxy: ''
-      HTTP_PROXY: ''
-      HTTPS_PROXY: ''
+
 
     steps:
       - name: Checkout
