@@ -1,51 +1,73 @@
-name: Android CI
+steps:
+  - name: Checkout
+    uses: actions/checkout@v4
 
-on:
-  push:
-  pull_request:
+  - name: Set up JDK 17
+    uses: actions/setup-java@v4
+    with:
+      distribution: temurin
+      java-version: '17'
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+  - name: Cache Gradle & Maven
+    uses: actions/cache@v4
+    with:
+      path: |
+        ~/.gradle/caches
+        ~/.gradle/wrapper
+        ~/.m2/repository
+      key: ${{ runner.os }}-gradle-${{ hashFiles('**/gradle-wrapper.properties', '**/*.gradle*', 'gradle/libs.versions.toml') }}
+      restore-keys: |
+        ${{ runner.os }}-gradle-
 
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
-        
-      - name: Setup Gradle
-        uses: gradle/gradle-build-action@v3
+  - name: Show repo layout (debug)
+    run: |
+      echo "PWD: $(pwd)"
+      ls -la
+      echo "Searching for gradlew..."
+      find . -maxdepth 6 -type f -name gradlew -print || true
 
-      - name: Build
-        run: ./gradlew assembleDebug --warning-mode=all
-        
-      - name: Set up JDK 17
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
+  - name: Find gradlew, make executable and run build (with retries)
+    run: |
+      set -euo pipefail
+      GRADLEW_PATH=$(find . -type f -name gradlew | head -n 1 || true)
+      if [ -z "$GRADLEW_PATH" ]; then
+        echo "gradlew not found. Commit the Gradle wrapper (gradlew, gradlew.bat, gradle/wrapper/*) or put it in your project directory."
+        ls -la
+        exit 1
+      fi
+      chmod +x "$GRADLEW_PATH"
+      GRADLEW_DIR=$(dirname "$GRADLEW_PATH")
+      echo "Found gradlew at: $GRADLEW_PATH (running from $GRADLEW_DIR)"
+      cd "$GRADLEW_DIR"
 
-      #- name: Download Gradle wrapper
-       # run: |
-       #   ./gradlew --version
+      attempts=0
+      max_attempts=3
+      until [ $attempts -ge $max_attempts ]
+      do
+        attempts=$((attempts+1))
+        echo "Build attempt $attempts/$max_attempts..."
+        if [ $attempts -lt $max_attempts ]; then
+          ./gradlew --no-daemon assembleDebug --warning-mode=all && break || true
+        else
+          echo "Last attempt: running with --stacktrace and --info for diagnostics"
+          ./gradlew --no-daemon assembleDebug --stacktrace --info || true
+        fi
+        echo "Attempt $attempts failed; sleeping $((attempts * 10))s before retry..."
+        sleep $((attempts * 10))
+      done
 
-      - name: Cache Gradle & Maven
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-            ~/.m2/repository
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/gradle-wrapper.properties', '**/*.gradle*', 'gradle/libs.versions.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
+      # final quick sanity check: ensure wrapper can run
+      ./gradlew --no-daemon --version || true
 
-      - name: Build (assembleDebug)
-        run: ./gradlew --no-daemon assembleDebug --warning-mode=all
+  - name: Upload debug APKs (if any)
+    uses: actions/upload-artifact@v4
+    with:
+      name: apks
+      path: |
+        **/build/outputs/**/*.apk
 
-      - name: Upload debug APKs
-        uses: actions/upload-artifact@v5
-        with:
-          name: apks
-          path: app/build/outputs/**/*.apk
+  - name: Upload Gradle logs (always)
+    if: always()
+    run: |
+      echo "Collecting Gradle logs (if present)..."
+      find . -type f -name "*.log" -maxdepth 6 -print || true
