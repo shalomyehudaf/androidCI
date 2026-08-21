@@ -1,4 +1,4 @@
-# Android CI - pre-download Gradle distribution, activate it so the wrapper doesn't re-download,
+# Android CI - pre-download Gradle distribution, patch wrapper to local file:// zip so the wrapper won't re-download,
 # find the gradle wrapper anywhere, run build from its directory, and upload artifacts.
 name: Android CI
 
@@ -22,6 +22,7 @@ jobs:
           java-version: '17'
 
       - name: Cache Gradle & Maven
+        id: cache
         uses: actions/cache@v5
         with:
           path: |
@@ -32,6 +33,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
+      - name: Cache status
+        run: |
+          echo "Cache hit: ${{ steps.cache.outputs.cache-hit }}"
+          echo "Cache matched key: ${{ steps.cache.outputs.cache-key || 'none' }}"
+
       - name: Show repo layout (debug)
         run: |
           echo "PWD: $(pwd)"
@@ -40,10 +46,10 @@ jobs:
           find . -maxdepth 6 -type f -name gradle-wrapper.properties -print || true
           find . -maxdepth 6 -type f -name gradlew -print || true
 
-      - name: Pre-download Gradle distribution (from secret or wrapper URL) and unpack
+      - name: Pre-download Gradle distribution (download to /tmp and unpack)
         run: |
           set -euo pipefail
-          # Allow overriding the distribution URL via secret (recommended as a release asset)
+          # Prefer a secret-hosted distribution URL if provided (recommended)
           if [ -n "${{ secrets.GRADLE_DIST_URL || '' }}" ]; then
             DIST_URL="${{ secrets.GRADLE_DIST_URL }}"
             echo "Using GRADLE_DIST_URL from secrets: $DIST_URL"
@@ -64,46 +70,79 @@ jobs:
           fi
 
           DIST_NAME=$(basename "$DIST_URL")
-          BASE_NAME=${DIST_NAME%.zip}   # e.g. gradle-9.5.0-bin
-          GRADLE_USER_HOME="${HOME}/.gradle"
           TMP_ZIP="/tmp/${DIST_NAME}"
           echo "Downloading $DIST_URL to $TMP_ZIP"
 
-          # robust curl: connect timeout, long total max time, retries
+          # robust curl with connect timeout, long total time, and retries
           curl -fL --connect-timeout 30 --max-time 1200 --retry 8 --retry-delay 10 -o "$TMP_ZIP" "$DIST_URL"
 
           echo "Computing SHA256 for zip to create deterministic wrapper cache subdir..."
           ZIP_SHA=$(sha256sum "$TMP_ZIP" | awk '{print $1}')
+          BASE_NAME=${DIST_NAME%.zip}   # e.g. gradle-9.5.0-bin
+          GRADLE_USER_HOME="${HOME}/.gradle"
           DEST_DIR="$GRADLE_USER_HOME/wrapper/dists/$BASE_NAME/$ZIP_SHA"
           mkdir -p "$DEST_DIR"
           echo "Unpacking $TMP_ZIP -> $DEST_DIR"
-          unzip -q "$TMP_ZIP" -d "$DEST_DIR"
-          rm -f "$TMP_ZIP"
+          unzip -q "$TMP_ZIP" -d "$DEST_DIR" || true
           echo "Unpacked. Contents:"
-          ls -la "$DEST_DIR"
+          ls -la "$DEST_DIR" || true
 
-      - name: Activate pre-downloaded Gradle and verify
+      - name: Patch wrapper to local file and verify
         run: |
           set -euo pipefail
-          export GRADLE_USER_HOME="${HOME}/.gradle"
-          echo "GRADLE_USER_HOME=$GRADLE_USER_HOME"
-          echo "Wrapper dists:"
-          ls -la "$GRADLE_USER_HOME/wrapper/dists" || true
-          echo "Find distribution directories:"
-          find "$GRADLE_USER_HOME/wrapper/dists" -maxdepth 3 -type d -print || true
 
-          # If gradlew is at the repo root, make it executable; otherwise find and exec
+          TMP_ZIP="/tmp/$(basename "${{ secrets.GRADLE_DIST_URL || '' }}" || true)"
+          # If secret wasn't set, fall back to the file downloaded earlier by extracting name from wrapper (if any).
+          if [ ! -f "$TMP_ZIP" ]; then
+            # Determine TMP_ZIP by finding the tmp file created earlier (pattern)
+            # We expect /tmp/gradle-*-bin.zip created by Pre-download; pick the newest matching file.
+            TMP_ZIP=$(ls -1t /tmp/gradle-*-bin.zip 2>/dev/null | head -n1 || true)
+          fi
+
+          if [ -z "$TMP_ZIP" ] || [ ! -f "$TMP_ZIP" ]; then
+            echo "Expected gradle zip in /tmp but none found; aborting patch step."
+            exit 1
+          fi
+
+          echo "Using local zip: $TMP_ZIP"
+
+          # Find gradlew and its directory
           GRADLEW_PATH=$(find . -type f -name gradlew | head -n 1 || true)
           if [ -z "$GRADLEW_PATH" ]; then
-            echo "gradlew not found in repo; nothing to run here."
+            echo "gradlew not found in repository; nothing to patch."
             exit 0
           fi
-          chmod +x "$GRADLEW_PATH"
           GRADLEW_DIR=$(dirname "$GRADLEW_PATH")
-          echo "Running wrapper verification from: $GRADLEW_DIR"
-          cd "$GRADLEW_DIR"
+          echo "gradlew found at: $GRADLEW_PATH (dir: $GRADLEW_DIR)"
 
-          # Run --version to force the wrapper to pick the pre-downloaded distribution.
+          # Prefer gradle/wrapper/gradle-wrapper.properties located relative to gradlew
+          WRAPPER_PROPS="$GRADLEW_DIR/gradle/wrapper/gradle-wrapper.properties"
+          if [ ! -f "$WRAPPER_PROPS" ]; then
+            WRAPPER_PROPS=$(find "$GRADLEW_DIR" -maxdepth 6 -type f -name gradle-wrapper.properties | head -n 1 || true)
+          fi
+          if [ -z "$WRAPPER_PROPS" ]; then
+            # fallback: search repo
+            WRAPPER_PROPS=$(find . -type f -name gradle-wrapper.properties | head -n 1 || true)
+          fi
+
+          if [ -z "$WRAPPER_PROPS" ]; then
+            echo "No gradle-wrapper.properties found to patch; the wrapper will try to download. Exiting."
+            exit 1
+          fi
+
+          echo "Patching wrapper properties at: $WRAPPER_PROPS"
+
+          NEW_LINE="distributionUrl=file://$TMP_ZIP"
+          # Replace or append distributionUrl in workspace copy of wrapper properties
+          awk -v new="$NEW_LINE" 'BEGIN{changed=0} /^distributionUrl=/ {print new; changed=1; next} {print} END{if(changed==0) print new}' "$WRAPPER_PROPS" > "$WRAPPER_PROPS.tmp" && mv "$WRAPPER_PROPS.tmp" "$WRAPPER_PROPS"
+
+          echo "Patched distributionUrl (workspace):"
+          grep -E '^distributionUrl=' "$WRAPPER_PROPS" || true
+
+          # Make gradlew executable and verify wrapper chooses local file
+          chmod +x "$GRADLEW_PATH"
+          cd "$GRADLEW_DIR"
+          echo "Running './gradlew --version' to force the wrapper to use the local zip..."
           ./gradlew --no-daemon --version --warning-mode=all
 
       - name: Find gradlew, make executable and run build (with retries)
