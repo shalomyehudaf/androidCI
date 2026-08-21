@@ -1,5 +1,3 @@
-# Android CI - pre-download Gradle distribution, activate it so the wrapper doesn't re-download,
-# find the gradle wrapper anywhere, run build from its directory, and upload artifacts.
 name: Android CI
 
 on:
@@ -10,8 +8,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
-
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -41,10 +37,10 @@ jobs:
           find . -maxdepth 6 -type f -name gradle-wrapper.properties -print || true
           find . -maxdepth 6 -type f -name gradlew -print || true
 
-      - name: Pre-download Gradle distribution (from secret or wrapper URL) and unpack
+      - name: Pre-download Gradle distribution (download to /tmp and update wrapper to use file:///)
         run: |
           set -euo pipefail
-          # Allow overriding the distribution URL via secret (recommended as a release asset)
+          # If you provided a GRADLE_DIST_URL secret, prefer that (release asset)
           if [ -n "${{ secrets.GRADLE_DIST_URL || '' }}" ]; then
             DIST_URL="${{ secrets.GRADLE_DIST_URL }}"
             echo "Using GRADLE_DIST_URL from secrets: $DIST_URL"
@@ -59,31 +55,43 @@ jobs:
               echo "distributionUrl not found in $WRAPPER_PROPS; skipping pre-download."
               exit 0
             fi
-            # prefer the direct downloads.gradle.org CDN to avoid services.gradle.org redirect timeouts
+            # prefer the direct downloads.gradle.org CDN to avoid redirect timeouts
             DIST_URL=${DIST_URL/services.gradle.org/downloads.gradle.org}
             echo "Using distributionUrl from wrapper: $DIST_URL"
           fi
 
           DIST_NAME=$(basename "$DIST_URL")
-          BASE_NAME=${DIST_NAME%.zip}   # e.g. gradle-9.5.0-bin
-          GRADLE_USER_HOME="${HOME}/.gradle"
           TMP_ZIP="/tmp/${DIST_NAME}"
           echo "Downloading $DIST_URL to $TMP_ZIP"
 
-          # robust curl: connect timeout, long total max time, retries
+          # robust curl with connect timeout and retries
           curl -fL --connect-timeout 30 --max-time 1200 --retry 8 --retry-delay 10 -o "$TMP_ZIP" "$DIST_URL"
 
+          # Optional: compute SHA and unpack into the wrapper cache so it's available for other processes
           echo "Computing SHA256 for zip to create deterministic wrapper cache subdir..."
           ZIP_SHA=$(sha256sum "$TMP_ZIP" | awk '{print $1}')
+          BASE_NAME=${DIST_NAME%.zip}   # e.g. gradle-9.5.0-bin
+          GRADLE_USER_HOME="${HOME}/.gradle"
           DEST_DIR="$GRADLE_USER_HOME/wrapper/dists/$BASE_NAME/$ZIP_SHA"
           mkdir -p "$DEST_DIR"
           echo "Unpacking $TMP_ZIP -> $DEST_DIR"
-          unzip -q "$TMP_ZIP" -d "$DEST_DIR"
-          rm -f "$TMP_ZIP"
-          echo "Unpacked. Contents:"
-          ls -la "$DEST_DIR"
+          unzip -q "$TMP_ZIP" -d "$DEST_DIR" || true
+          echo "Unpacked. Contents (if any):"
+          ls -la "$DEST_DIR" || true
 
-      - name: Activate pre-downloaded Gradle and verify
+          # Update the workspace gradle-wrapper.properties to point at the local file URL so the wrapper won't try to fetch network
+          WRAPPER_PROPS_LOCAL=$(find . -type f -name gradle-wrapper.properties | head -n 1 || true)
+          if [ -n "$WRAPPER_PROPS_LOCAL" ]; then
+            echo "Adjusting distributionUrl in $WRAPPER_PROPS_LOCAL to point to file://$TMP_ZIP (workspace only)"
+            # Escape slashes for sed; use temp file to avoid BSD/GNU sed portability issues
+            awk -v new="distributionUrl=file://$TMP_ZIP" 'BEGIN{changed=0} /^distributionUrl=/ {print new; changed=1; next} {print} END{if(changed==0) print new}' "$WRAPPER_PROPS_LOCAL" > "$WRAPPER_PROPS_LOCAL.tmp" && mv "$WRAPPER_PROPS_LOCAL.tmp" "$WRAPPER_PROPS_LOCAL"
+            echo "Updated gradle-wrapper.properties (workspace):"
+            grep -E '^distributionUrl=' "$WRAPPER_PROPS_LOCAL" || true
+          else
+            echo "No local gradle-wrapper.properties found to patch."
+          fi
+
+      - name: Activate pre-downloaded Gradle and verify (runs wrapper against local file)
         run: |
           set -euo pipefail
           export GRADLE_USER_HOME="${HOME}/.gradle"
@@ -93,7 +101,6 @@ jobs:
           echo "Find distribution directories:"
           find "$GRADLE_USER_HOME/wrapper/dists" -maxdepth 3 -type d -print || true
 
-          # If gradlew is at the repo root, make it executable; otherwise find and exec
           GRADLEW_PATH=$(find . -type f -name gradlew | head -n 1 || true)
           if [ -z "$GRADLEW_PATH" ]; then
             echo "gradlew not found in repo; nothing to run here."
@@ -104,7 +111,7 @@ jobs:
           echo "Running wrapper verification from: $GRADLEW_DIR"
           cd "$GRADLEW_DIR"
 
-          # Run --version to force the wrapper to pick the pre-downloaded distribution.
+          # Running --version should now read the local file:// zip set above and not attempt a network fetch.
           ./gradlew --no-daemon --version --warning-mode=all
 
       - name: Find gradlew, make executable and run build (with retries)
