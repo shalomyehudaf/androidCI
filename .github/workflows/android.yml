@@ -21,6 +21,7 @@ jobs:
           java-version: '17'
 
       - name: Cache Gradle & Maven
+        id: cache
         uses: actions/cache@v5
         with:
           path: |
@@ -30,6 +31,11 @@ jobs:
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/gradle-wrapper.properties', '**/*.gradle*', 'gradle/libs.versions.toml') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
+
+      - name: Cache status
+        run: |
+          echo "Cache hit: ${{ steps.cache.outputs.cache-hit }}"
+          echo "Cache matched key: ${{ steps.cache.outputs.cache-key || 'none' }}"
 
       - name: Show repo layout (debug)
         run: |
